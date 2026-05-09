@@ -218,6 +218,7 @@ static void httpStatus() {
     unsigned long runtime = millis() - lastStatsReset;
     uint32_t currentRate = (isStreaming && runtime > 1000) ? (audioPacketsSent * 1000) / runtime : 0;
     String json = "{";
+    json.reserve(1800);
     json += "\"fw_version\":\"" + String(FW_VERSION_STR) + "\",";
     json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
     json += "\"stream_url_ip\":\"rtsp://" + WiFi.localIP().toString() + ":8554/audio1\",";
@@ -289,6 +290,7 @@ static void httpStatus() {
 static void httpAudioStatus() {
     float latency_ms = (float)currentBufferSize / currentSampleRate * 1000.0f;
     String json = "{";
+    json.reserve(360);
     json += "\"sample_rate\":" + String(currentSampleRate) + ",";
     json += "\"gain\":" + String(currentGainFactor,2) + ",";
     json += "\"buffer_size\":" + String(currentBufferSize) + ",";
@@ -312,6 +314,7 @@ static void httpAudioStatus() {
 
 static void httpPerfStatus() {
     String json = "{";
+    json.reserve(220);
     json += "\"restart_threshold_pkt_s\":" + String(minAcceptableRate) + ",";
     json += "\"check_interval_min\":" + String(performanceCheckInterval) + ",";
     json += "\"auto_recovery\":" + String(autoRecoveryEnabled?"true":"false") + ",";
@@ -329,6 +332,7 @@ static void httpThermal() {
     }
     bool manualRequired = overheatLatched || (!rtspServerEnabled && overheatProtectionEnabled && overheatTripTemp > 0.0f);
     String json = "{";
+    json.reserve(520);
     if (lastTemperatureValid) {
         json += "\"current_c\":" + String(lastTemperatureC,1) + ",";
     } else {
@@ -376,6 +380,7 @@ static void httpThermalClear() {
 
 static void httpLogs() {
     String out;
+    out.reserve(LOG_CAP * 96);
     for (size_t i=0;i<logCount;i++){
         size_t idx = (logHead + LOG_CAP - logCount + i) % LOG_CAP;
         out += logBuffer[idx]; out += '\n';

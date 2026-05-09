@@ -6,6 +6,7 @@
 - Transport: auto-derived from backend target (TCP for BirdNET-Go, UDP for BirdNET-Pi), removed manual selector.
 - Backend routing: per-stream target selector BirdNET-Go / BirdNET-Pi persisted in NVS.
 - Per-stream live stats: client count, streaming state, packet rate, last play time.
+- MQTT/Home Assistant: discovery now exposes stream 1 and stream 2 separately, including enable switches, streaming status, client counts, packet rates, RTSP URLs, and BirdNET target selects.
 - MQTT: reconnect now allowed during streaming with longer interval (120s) instead of blocking indefinitely.
 - mDNS: fixed hostname collision on ESP32-C6 — `buildMqttMacSuffix()` now uses `WiFi.macAddress()` (big-endian) instead of `ESP.getEfuseMac()` (little-endian), which caused boards from the same vendor to share the same default hostname.
 - API: `/api/status` exposes per-stream URLs, enabled state, max_clients, and live stats.

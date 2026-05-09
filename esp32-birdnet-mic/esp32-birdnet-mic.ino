@@ -11,6 +11,7 @@
 #include <PubSubClient.h>
 #include <time.h>
 #include <math.h>
+#include <esp_mac.h>
 #include <esp_sleep.h>
 #include <esp_system.h>
 #include <WiFiUdp.h>
@@ -141,6 +142,8 @@ struct StreamStats {
 StreamStats streamStats[2];
 
 void stopAllRtspClients(const char* reason);
+void stopRtspClientsForStream(uint8_t profileIndex, const char* reason);
+void getStreamClientCounts(uint8_t &s1, uint8_t &s2);
 uint8_t getRtspClientCount();
 String getRtspClientSummary();
 
@@ -274,6 +277,7 @@ void scheduleReboot(bool factoryReset, uint32_t delayMs);
 void scheduleWifiReconnect(const uint8_t *bssid, uint32_t delayMs);
 void mqttRequestReconnect(bool forceDiscovery);
 void mqttPublishDiscoverySoon();
+void saveAudioSettings();
 
 // -- WiFi TX power (configurable)
 float wifiTxPowerDbm = DEFAULT_WIFI_TX_DBM;
@@ -458,14 +462,43 @@ static String mqttJsonEscape(const String &s) {
     return o;
 }
 
+static bool isZeroMacBytes(const uint8_t mac[6]) {
+    for (uint8_t i = 0; i < 6; ++i) {
+        if (mac[i] != 0) return false;
+    }
+    return true;
+}
+
+static String macBytesToHex(const uint8_t mac[6]) {
+    char buf[13];
+    snprintf(buf, sizeof(buf), "%02x%02x%02x%02x%02x%02x",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    return String(buf);
+}
+
 static String buildMqttMacSuffix() {
-    // WiFi.macAddress() returns MAC in standard big-endian format
-    // (e.g. "58:E6:C5:13:8C:30"). ESP.getEfuseMac() returns little-endian,
-    // which caused boards from the same vendor to share the same mDNS suffix
-    // because the OUI ended up in the last hex digits.
-    String mac = WiFi.macAddress();
-    mac.replace(":", "");
-    return mac;
+    uint8_t mac[6] = {0};
+    if (esp_read_mac(mac, ESP_MAC_WIFI_STA) == ESP_OK && !isZeroMacBytes(mac)) {
+        return macBytesToHex(mac);
+    }
+
+    // Fallback for unusual cores: WiFi.macAddress() is valid after Wi-Fi init.
+    String macStr = WiFi.macAddress();
+    macStr.replace(":", "");
+    macStr.toLowerCase();
+    if (macStr != "000000000000") return macStr;
+
+    // Last-resort fallback, formatted in standard MAC byte order.
+    uint64_t efuse = ESP.getEfuseMac();
+    mac[0] = (uint8_t)(efuse >> 40);
+    mac[1] = (uint8_t)(efuse >> 32);
+    mac[2] = (uint8_t)(efuse >> 24);
+    mac[3] = (uint8_t)(efuse >> 16);
+    mac[4] = (uint8_t)(efuse >> 8);
+    mac[5] = (uint8_t)efuse;
+    if (!isZeroMacBytes(mac)) return macBytesToHex(mac);
+
+    return "000000000000";
 }
 
 static String defaultMdnsHostname() {
@@ -542,12 +575,52 @@ static String sanitizeMqttClientId(const String &input, const String &fallback) 
     return out;
 }
 
+static bool isHexMacSuffix(const String &s) {
+    if (s.length() != 12) return false;
+    for (size_t i = 0; i < s.length(); ++i) {
+        char c = s[i];
+        bool ok = (c >= '0' && c <= '9') ||
+                  (c >= 'a' && c <= 'f') ||
+                  (c >= 'A' && c <= 'F');
+        if (!ok) return false;
+    }
+    return true;
+}
+
+static String mqttDeviceMacSuffix() {
+    const String prefix = "esp32mic_";
+    if (mqttDeviceId.startsWith(prefix)) {
+        String suffix = mqttDeviceId.substring(prefix.length());
+        suffix.toLowerCase();
+        if (isHexMacSuffix(suffix)) return suffix;
+    }
+    return buildMqttMacSuffix();
+}
+
 static String mqttDefaultTopicPrefix() {
-    return String("esp32mic/") + mqttDeviceId;
+    return String("esp32mic/") + mqttDeviceMacSuffix();
 }
 
 static String mqttDefaultClientId() {
-    return String("esp32mic-") + mqttDeviceId;
+    return String("esp32mic-") + mqttDeviceMacSuffix();
+}
+
+static bool mqttIsLegacyDefaultTopicPrefix(const String &value) {
+    String v = value;
+    v.toLowerCase();
+    return v == String("esp32mic/") + mqttDeviceId ||
+           v == "esp32mic/esp32mic_000000000000" ||
+           v == "esp32mic_000000000000" ||
+           v == "esp32mic/000000000000";
+}
+
+static bool mqttIsLegacyDefaultClientId(const String &value) {
+    String v = value;
+    v.toLowerCase();
+    return v == String("esp32mic-") + mqttDeviceId ||
+           v == "esp32mic-esp32mic_000000000000" ||
+           v == "esp32mic_000000000000" ||
+           v == "esp32mic-000000000000";
 }
 
 static String mqttStateTopic() {
@@ -562,8 +635,20 @@ static String mqttCmdRtspTopic() {
     return mqttTopicPrefix + "/cmd/rtsp_server";
 }
 
+static String mqttCmdStreamEnabledTopic(uint8_t profileIndex) {
+    return mqttTopicPrefix + "/cmd/stream" + String(profileIndex + 1) + "_enabled";
+}
+
+static String mqttCmdStreamTargetTopic(uint8_t profileIndex) {
+    return mqttTopicPrefix + "/cmd/stream" + String(profileIndex + 1) + "_target";
+}
+
 static String mqttCmdRebootTopic() {
     return mqttTopicPrefix + "/cmd/reboot";
+}
+
+static String streamTargetName(uint8_t target) {
+    return (target == STREAM_TARGET_BIRDNET_PI) ? String("BirdNET-Pi") : String("BirdNET-Go");
 }
 
 static void mqttNormalizeSettings() {
@@ -575,6 +660,12 @@ static void mqttNormalizeSettings() {
     if (mqttPort == 0) mqttPort = DEFAULT_MQTT_PORT;
     if (mqttDeviceId.length() == 0) {
         mqttDeviceId = sanitizeMqttClientId(String("esp32mic_") + buildMqttMacSuffix(), "esp32mic");
+    }
+    if (mqttIsLegacyDefaultTopicPrefix(sanitizeMqttTopicPath(mqttTopicPrefix, ""))) {
+        mqttTopicPrefix = "";
+    }
+    if (mqttIsLegacyDefaultClientId(sanitizeMqttClientId(mqttClientId, ""))) {
+        mqttClientId = "";
     }
     mqttTopicPrefix = sanitizeMqttTopicPath(mqttTopicPrefix, mqttDefaultTopicPrefix());
     mqttDiscoveryPrefix = sanitizeMqttTopicPath(mqttDiscoveryPrefix, "homeassistant");
@@ -606,6 +697,19 @@ static String mqttBuildStateJson() {
                                        ? (uint32_t)((nowMs - streamStartedAtMs) / 1000UL)
                                        : 0;
     uint8_t clientCount = getRtspClientCount();
+    uint8_t s1clients = 0, s2clients = 0;
+    getStreamClientCounts(s1clients, s2clients);
+    uint32_t streamRate[2] = {0, 0};
+    uint32_t streamLastPlayAge[2] = {0, 0};
+    for (uint8_t i = 0; i < 2; i++) {
+        unsigned long streamRuntime = nowMs - streamStats[i].statsResetMs;
+        if (streamStats[i].streaming && streamRuntime > 1000) {
+            streamRate[i] = (streamStats[i].packetsSent * 1000) / streamRuntime;
+        }
+        if (streamStats[i].lastPlayMs > 0 && nowMs >= streamStats[i].lastPlayMs) {
+            streamLastPlayAge[i] = (uint32_t)((nowMs - streamStats[i].lastPlayMs) / 1000UL);
+        }
+    }
 
     String json = "{";
     json += "\"fw_version\":\"" + mqttJsonEscape(String(FW_VERSION_STR)) + "\",";
@@ -625,6 +729,22 @@ static String mqttBuildStateJson() {
     json += "\"stream_uptime_s\":" + String(streamUptimeSeconds) + ",";
     json += "\"client_count\":" + String((uint32_t)clientCount) + ",";
     json += "\"current_rate_pkt_s\":" + String(currentRate) + ",";
+    json += "\"stream1_url_ip\":\"rtsp://" + mqttJsonEscape(WiFi.localIP().toString()) + ":8554/audio1\",";
+    json += "\"stream2_url_ip\":\"rtsp://" + mqttJsonEscape(WiFi.localIP().toString()) + ":8554/audio2\",";
+    json += "\"stream1_url_mdns\":\"rtsp://" + mqttJsonEscape(mdnsHostname) + ".local:8554/audio1\",";
+    json += "\"stream2_url_mdns\":\"rtsp://" + mqttJsonEscape(mdnsHostname) + ".local:8554/audio2\",";
+    json += "\"stream1_enabled\":" + String(streamEnabled[0] ? "true" : "false") + ",";
+    json += "\"stream2_enabled\":" + String(streamEnabled[1] ? "true" : "false") + ",";
+    json += "\"stream1_streaming\":" + String(streamStats[0].streaming ? "true" : "false") + ",";
+    json += "\"stream2_streaming\":" + String(streamStats[1].streaming ? "true" : "false") + ",";
+    json += "\"stream1_clients\":" + String((uint32_t)s1clients) + ",";
+    json += "\"stream2_clients\":" + String((uint32_t)s2clients) + ",";
+    json += "\"stream1_packet_rate\":" + String(streamRate[0]) + ",";
+    json += "\"stream2_packet_rate\":" + String(streamRate[1]) + ",";
+    json += "\"stream1_target\":\"" + streamTargetName(streamProfiles[0].target) + "\",";
+    json += "\"stream2_target\":\"" + streamTargetName(streamProfiles[1].target) + "\",";
+    json += "\"stream1_last_play_age_s\":" + String(streamLastPlayAge[0]) + ",";
+    json += "\"stream2_last_play_age_s\":" + String(streamLastPlayAge[1]) + ",";
     json += "\"sample_rate\":" + String(currentSampleRate) + ",";
     json += "\"audio_format\":\"L16/mono\",";
     json += "\"buffer_size\":" + String(currentBufferSize) + ",";
@@ -646,6 +766,70 @@ static bool mqttPublishDiscoveryConfig(const String &component, const String &ob
     return mqttClient.publish(topic.c_str(), payload.c_str(), true);
 }
 
+struct MqttDiscoveryEntity {
+    const char *component;
+    const char *objectId;
+};
+
+static const MqttDiscoveryEntity MQTT_DISCOVERY_ENTITIES[] = {
+    {"sensor", "wifi_rssi"},
+    {"sensor", "heap_kb"},
+    {"sensor", "packet_rate"},
+    {"sensor", "temperature_c"},
+    {"sensor", "max_temperature_c"},
+    {"sensor", "uptime_s"},
+    {"binary_sensor", "streaming"},
+    {"switch", "rtsp_server"},
+    {"sensor", "rtsp_client"},
+    {"sensor", "fw_version"},
+    {"sensor", "fw_build"},
+    {"sensor", "reboot_reason"},
+    {"sensor", "restart_counter"},
+    {"sensor", "wifi_ssid"},
+    {"sensor", "wifi_reconnect_count"},
+    {"sensor", "stream_uptime_s"},
+    {"sensor", "client_count"},
+    {"switch", "stream1_enabled"},
+    {"switch", "stream2_enabled"},
+    {"binary_sensor", "stream1_streaming"},
+    {"binary_sensor", "stream2_streaming"},
+    {"sensor", "stream1_clients"},
+    {"sensor", "stream2_clients"},
+    {"sensor", "stream1_packet_rate"},
+    {"sensor", "stream2_packet_rate"},
+    {"sensor", "stream1_url"},
+    {"sensor", "stream2_url"},
+    {"select", "stream1_target"},
+    {"select", "stream2_target"},
+    {"sensor", "sample_rate_hz"},
+    {"sensor", "audio_format"},
+    {"button", "reboot"},
+};
+
+static void mqttClearRetainedTopic(const String &topic) {
+    if (topic.length() == 0) return;
+    mqttClient.publish(topic.c_str(), "", true);
+}
+
+static void mqttClearDiscoveryForDeviceId(const String &deviceId) {
+    if (deviceId.length() == 0 || deviceId == mqttDeviceId) return;
+    for (const MqttDiscoveryEntity &entity : MQTT_DISCOVERY_ENTITIES) {
+        String topic = mqttDiscoveryPrefix + "/" + entity.component + "/" + deviceId + "/" + entity.objectId + "/config";
+        mqttClearRetainedTopic(topic);
+    }
+}
+
+static void mqttClearLegacyRetainedTopics() {
+    mqttClearDiscoveryForDeviceId("esp32mic_000000000000");
+
+    String currentAvailability = mqttAvailabilityTopic();
+    String oldZeroAvailability = "esp32mic/esp32mic_000000000000/availability";
+    if (oldZeroAvailability != currentAvailability) mqttClearRetainedTopic(oldZeroAvailability);
+
+    String oldRepeatedAvailability = String("esp32mic/") + mqttDeviceId + "/availability";
+    if (oldRepeatedAvailability != currentAvailability) mqttClearRetainedTopic(oldRepeatedAvailability);
+}
+
 static bool mqttPublishState(bool force) {
     if (!mqttClient.connected()) return false;
     unsigned long now = millis();
@@ -661,11 +845,17 @@ static bool mqttPublishState(bool force) {
 static bool mqttPublishDiscovery() {
     if (!mqttClient.connected()) return false;
 
+    mqttClearLegacyRetainedTopics();
+
     String dev = mqttBuildDeviceJson();
     String st = mqttStateTopic();
     String av = mqttAvailabilityTopic();
     String cmdRtsp = mqttCmdRtspTopic();
     String cmdReboot = mqttCmdRebootTopic();
+    String cmdS1Enabled = mqttCmdStreamEnabledTopic(0);
+    String cmdS2Enabled = mqttCmdStreamEnabledTopic(1);
+    String cmdS1Target = mqttCmdStreamTargetTopic(0);
+    String cmdS2Target = mqttCmdStreamTargetTopic(1);
     bool ok = true;
 
     String p;
@@ -721,6 +911,42 @@ static bool mqttPublishDiscovery() {
     p = "{\"name\":\"RTSP Client Count\",\"uniq_id\":\"" + mqttDeviceId + "_client_count\",\"stat_t\":\"" + st + "\",\"val_tpl\":\"{{ value_json.client_count }}\",\"stat_cla\":\"measurement\",\"ent_cat\":\"diagnostic\",\"ic\":\"mdi:account-multiple\",\"avty_t\":\"" + av + "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}";
     ok &= mqttPublishDiscoveryConfig("sensor", "client_count", p);
 
+    p = "{\"name\":\"Stream 1 Enabled\",\"uniq_id\":\"" + mqttDeviceId + "_stream1_enabled\",\"stat_t\":\"" + st + "\",\"val_tpl\":\"{{ 'ON' if value_json.stream1_enabled else 'OFF' }}\",\"pl_on\":\"ON\",\"pl_off\":\"OFF\",\"cmd_t\":\"" + cmdS1Enabled + "\",\"ic\":\"mdi:microphone\",\"avty_t\":\"" + av + "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}";
+    ok &= mqttPublishDiscoveryConfig("switch", "stream1_enabled", p);
+
+    p = "{\"name\":\"Stream 2 Enabled\",\"uniq_id\":\"" + mqttDeviceId + "_stream2_enabled\",\"stat_t\":\"" + st + "\",\"val_tpl\":\"{{ 'ON' if value_json.stream2_enabled else 'OFF' }}\",\"pl_on\":\"ON\",\"pl_off\":\"OFF\",\"cmd_t\":\"" + cmdS2Enabled + "\",\"ic\":\"mdi:microphone\",\"avty_t\":\"" + av + "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}";
+    ok &= mqttPublishDiscoveryConfig("switch", "stream2_enabled", p);
+
+    p = "{\"name\":\"Stream 1 Streaming\",\"uniq_id\":\"" + mqttDeviceId + "_stream1_streaming\",\"stat_t\":\"" + st + "\",\"val_tpl\":\"{{ 'ON' if value_json.stream1_streaming else 'OFF' }}\",\"pl_on\":\"ON\",\"pl_off\":\"OFF\",\"dev_cla\":\"running\",\"avty_t\":\"" + av + "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}";
+    ok &= mqttPublishDiscoveryConfig("binary_sensor", "stream1_streaming", p);
+
+    p = "{\"name\":\"Stream 2 Streaming\",\"uniq_id\":\"" + mqttDeviceId + "_stream2_streaming\",\"stat_t\":\"" + st + "\",\"val_tpl\":\"{{ 'ON' if value_json.stream2_streaming else 'OFF' }}\",\"pl_on\":\"ON\",\"pl_off\":\"OFF\",\"dev_cla\":\"running\",\"avty_t\":\"" + av + "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}";
+    ok &= mqttPublishDiscoveryConfig("binary_sensor", "stream2_streaming", p);
+
+    p = "{\"name\":\"Stream 1 Clients\",\"uniq_id\":\"" + mqttDeviceId + "_stream1_clients\",\"stat_t\":\"" + st + "\",\"val_tpl\":\"{{ value_json.stream1_clients }}\",\"stat_cla\":\"measurement\",\"ent_cat\":\"diagnostic\",\"ic\":\"mdi:account-multiple\",\"avty_t\":\"" + av + "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}";
+    ok &= mqttPublishDiscoveryConfig("sensor", "stream1_clients", p);
+
+    p = "{\"name\":\"Stream 2 Clients\",\"uniq_id\":\"" + mqttDeviceId + "_stream2_clients\",\"stat_t\":\"" + st + "\",\"val_tpl\":\"{{ value_json.stream2_clients }}\",\"stat_cla\":\"measurement\",\"ent_cat\":\"diagnostic\",\"ic\":\"mdi:account-multiple\",\"avty_t\":\"" + av + "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}";
+    ok &= mqttPublishDiscoveryConfig("sensor", "stream2_clients", p);
+
+    p = "{\"name\":\"Stream 1 Packet Rate\",\"uniq_id\":\"" + mqttDeviceId + "_stream1_packet_rate\",\"stat_t\":\"" + st + "\",\"val_tpl\":\"{{ value_json.stream1_packet_rate }}\",\"unit_of_meas\":\"pkt/s\",\"stat_cla\":\"measurement\",\"avty_t\":\"" + av + "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}";
+    ok &= mqttPublishDiscoveryConfig("sensor", "stream1_packet_rate", p);
+
+    p = "{\"name\":\"Stream 2 Packet Rate\",\"uniq_id\":\"" + mqttDeviceId + "_stream2_packet_rate\",\"stat_t\":\"" + st + "\",\"val_tpl\":\"{{ value_json.stream2_packet_rate }}\",\"unit_of_meas\":\"pkt/s\",\"stat_cla\":\"measurement\",\"avty_t\":\"" + av + "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}";
+    ok &= mqttPublishDiscoveryConfig("sensor", "stream2_packet_rate", p);
+
+    p = "{\"name\":\"Stream 1 URL\",\"uniq_id\":\"" + mqttDeviceId + "_stream1_url\",\"stat_t\":\"" + st + "\",\"val_tpl\":\"{{ value_json.stream1_url_ip }}\",\"ic\":\"mdi:link-variant\",\"avty_t\":\"" + av + "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}";
+    ok &= mqttPublishDiscoveryConfig("sensor", "stream1_url", p);
+
+    p = "{\"name\":\"Stream 2 URL\",\"uniq_id\":\"" + mqttDeviceId + "_stream2_url\",\"stat_t\":\"" + st + "\",\"val_tpl\":\"{{ value_json.stream2_url_ip }}\",\"ic\":\"mdi:link-variant\",\"avty_t\":\"" + av + "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}";
+    ok &= mqttPublishDiscoveryConfig("sensor", "stream2_url", p);
+
+    p = "{\"name\":\"Stream 1 Target\",\"uniq_id\":\"" + mqttDeviceId + "_stream1_target\",\"stat_t\":\"" + st + "\",\"val_tpl\":\"{{ value_json.stream1_target }}\",\"cmd_t\":\"" + cmdS1Target + "\",\"options\":[\"BirdNET-Go\",\"BirdNET-Pi\"],\"ic\":\"mdi:target\",\"avty_t\":\"" + av + "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}";
+    ok &= mqttPublishDiscoveryConfig("select", "stream1_target", p);
+
+    p = "{\"name\":\"Stream 2 Target\",\"uniq_id\":\"" + mqttDeviceId + "_stream2_target\",\"stat_t\":\"" + st + "\",\"val_tpl\":\"{{ value_json.stream2_target }}\",\"cmd_t\":\"" + cmdS2Target + "\",\"options\":[\"BirdNET-Go\",\"BirdNET-Pi\"],\"ic\":\"mdi:target\",\"avty_t\":\"" + av + "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}";
+    ok &= mqttPublishDiscoveryConfig("select", "stream2_target", p);
+
     p = "{\"name\":\"Sample Rate\",\"uniq_id\":\"" + mqttDeviceId + "_sample_rate_hz\",\"stat_t\":\"" + st + "\",\"val_tpl\":\"{{ value_json.sample_rate }}\",\"unit_of_meas\":\"Hz\",\"stat_cla\":\"measurement\",\"ent_cat\":\"diagnostic\",\"avty_t\":\"" + av + "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}";
     ok &= mqttPublishDiscoveryConfig("sensor", "sample_rate_hz", p);
 
@@ -764,6 +990,41 @@ static void mqttMessageCallback(char* topic, byte* payload, unsigned int length)
         }
         mqttPublishState(true);
         return;
+    }
+
+    for (uint8_t i = 0; i < 2; i++) {
+        if (t == mqttCmdStreamEnabledTopic(i)) {
+            if (up == "ON" || up == "OFF") {
+                bool enabled = (up == "ON");
+                if (streamEnabled[i] != enabled) {
+                    streamEnabled[i] = enabled;
+                    if (!enabled) stopRtspClientsForStream(i, "MQTT stream disabled");
+                    saveAudioSettings();
+                    simplePrintln("MQTT command: stream" + String(i + 1) + (enabled ? " enabled." : " disabled."));
+                }
+                mqttPublishState(true);
+            }
+            return;
+        }
+
+        if (t == mqttCmdStreamTargetTopic(i)) {
+            uint8_t target = streamProfiles[i].target;
+            if (up == "BIRDNET-GO" || up == "GO" || up == "0") {
+                target = STREAM_TARGET_BIRDNET_GO;
+            } else if (up == "BIRDNET-PI" || up == "PI" || up == "1") {
+                target = STREAM_TARGET_BIRDNET_PI;
+            } else {
+                return;
+            }
+            if (streamProfiles[i].target != target) {
+                streamProfiles[i].target = target;
+                stopRtspClientsForStream(i, "MQTT stream target changed");
+                saveAudioSettings();
+                simplePrintln("MQTT command: stream" + String(i + 1) + " target set to " + streamTargetName(target) + ".");
+            }
+            mqttPublishState(true);
+            return;
+        }
     }
 
     if (t == mqttCmdRebootTopic()) {
@@ -822,6 +1083,10 @@ static bool mqttConnectNow() {
     mqttLastError = "ok";
     mqttClient.publish(availTopic.c_str(), "online", true);
     mqttClient.subscribe(mqttCmdRtspTopic().c_str());
+    for (uint8_t i = 0; i < 2; i++) {
+        mqttClient.subscribe(mqttCmdStreamEnabledTopic(i).c_str());
+        mqttClient.subscribe(mqttCmdStreamTargetTopic(i).c_str());
+    }
     mqttClient.subscribe(mqttCmdRebootTopic().c_str());
     mqttDiscoveryPublished = false;
     if (!mqttPublishDiscovery()) {
@@ -2281,6 +2546,27 @@ String getRtspClientSummary() {
         summary += String(clients[i].profileIndex + 1);
     }
     return summary;
+}
+
+void stopRtspClientsForStream(uint8_t profileIndex, const char* reason) {
+    if (profileIndex >= 2) return;
+    bool hadStreaming = false;
+    for (uint8_t i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i].profileIndex != profileIndex) continue;
+        if (clients[i].streaming) hadStreaming = true;
+        clients[i].reset();
+    }
+    streamStats[profileIndex].streaming = false;
+    streamStats[profileIndex].clientCount = 0;
+    isStreaming = anyRtspSessionStreaming();
+    if (!isStreaming) {
+        rtspClient = WiFiClient();
+        rtspSessionId = "";
+    }
+    if (reason && reason[0]) {
+        lastStreamStopReason = reason;
+        if (hadStreaming) lastStreamStopMs = millis();
+    }
 }
 
 void stopAllRtspClients(const char* reason) {
