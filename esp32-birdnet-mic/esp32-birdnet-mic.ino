@@ -97,7 +97,7 @@ struct ClientSession {
     uint16_t serverRtpPort = 0;
     String sessionId = "";
     bool streaming = false;
-    uint8_t profileIndex = 0;  // 0 => /audio (legacy /audio1), 1 => /audio2
+    uint8_t profileIndex = 0;  // 0 => /audio1 (alias /audio), 1 => /audio2
     uint16_t rtpSequence = 0;
     uint32_t rtpTimestamp = 0;
     unsigned long lastActivity = 0;
@@ -139,6 +139,10 @@ struct StreamStats {
     unsigned long lastPlayMs = 0;
 };
 StreamStats streamStats[2];
+
+void stopAllRtspClients(const char* reason);
+uint8_t getRtspClientCount();
+String getRtspClientSummary();
 
 // -- RTSP Streaming
 String rtspSessionId = "";
@@ -594,12 +598,14 @@ static String mqttBuildDeviceJson() {
 static String mqttBuildStateJson() {
     unsigned long nowMs = millis();
     unsigned long uptimeSeconds = (nowMs - bootTime) / 1000;
+    uint32_t freeHeap = ESP.getFreeHeap();
+    if (freeHeap < minFreeHeap) minFreeHeap = freeHeap;
     unsigned long runtime = nowMs - lastStatsReset;
     uint32_t currentRate = (isStreaming && runtime > 1000) ? (audioPacketsSent * 1000) / runtime : 0;
     uint32_t streamUptimeSeconds = (isStreaming && streamStartedAtMs > 0 && nowMs >= streamStartedAtMs)
                                        ? (uint32_t)((nowMs - streamStartedAtMs) / 1000UL)
                                        : 0;
-    uint8_t clientCount = (rtspClient && rtspClient.connected()) ? 1 : 0;
+    uint8_t clientCount = getRtspClientCount();
 
     String json = "{";
     json += "\"fw_version\":\"" + mqttJsonEscape(String(FW_VERSION_STR)) + "\",";
@@ -611,7 +617,7 @@ static String mqttBuildStateJson() {
     json += "\"wifi_rssi\":" + String(WiFi.RSSI()) + ",";
     json += "\"wifi_reconnect_count\":" + String(wifiReconnectCount) + ",";
     json += "\"wifi_tx_dbm\":" + String(wifiPowerLevelToDbm(currentWifiPowerLevel), 1) + ",";
-    json += "\"free_heap_kb\":" + String(ESP.getFreeHeap() / 1024) + ",";
+    json += "\"free_heap_kb\":" + String(freeHeap / 1024) + ",";
     json += "\"min_free_heap_kb\":" + String(minFreeHeap / 1024) + ",";
     json += "\"uptime_s\":" + String(uptimeSeconds) + ",";
     json += "\"rtsp_server_enabled\":" + String(rtspServerEnabled ? "true" : "false") + ",";
@@ -623,11 +629,7 @@ static String mqttBuildStateJson() {
     json += "\"audio_format\":\"L16/mono\",";
     json += "\"buffer_size\":" + String(currentBufferSize) + ",";
     json += "\"gain\":" + String(currentGainFactor, 2) + ",";
-    if (rtspClient && rtspClient.connected()) {
-        json += "\"client\":\"" + mqttJsonEscape(rtspClient.remoteIP().toString()) + "\",";
-    } else {
-        json += "\"client\":\"\",";
-    }
+    json += "\"client\":\"" + mqttJsonEscape(getRtspClientSummary()) + "\",";
     if (lastTemperatureValid) json += "\"temperature_c\":" + String(lastTemperatureC, 1) + ",";
     else json += "\"temperature_c\":null,";
     json += "\"temperature_valid\":" + String(lastTemperatureValid ? "true" : "false") + ",";
@@ -756,8 +758,7 @@ static void mqttMessageCallback(char* topic, byte* payload, unsigned int length)
             }
         } else if (up == "OFF") {
             rtspServerEnabled = false;
-            if (rtspClient && rtspClient.connected()) rtspClient.stop();
-            isStreaming = false;
+            stopAllRtspClients("MQTT RTSP server disabled");
             rtspServer.stop();
             simplePrintln("MQTT command: RTSP server disabled.");
         }
@@ -875,7 +876,7 @@ void checkMqtt() {
     if (!mqttClient.connected()) {
         unsigned long now = millis();
         unsigned long interval = isStreaming ? MQTT_RECONNECT_STREAMING_MS : MQTT_RECONNECT_INTERVAL_MS;
-        if ((now - lastMqttReconnectAttempt) < interval) return;
+        if (lastMqttReconnectAttempt != 0 && (now - lastMqttReconnectAttempt) < interval) return;
         lastMqttReconnectAttempt = now;
         bool ok = mqttConnectNow();
         if (!ok && (now - lastMqttLogMs) > 60000UL) {
@@ -1112,14 +1113,7 @@ void checkStreamSchedule() {
     }
 
     if (!allowNow) {
-        if (rtspClient && rtspClient.connected()) {
-            rtspClient.stop();
-        }
-        if (isStreaming) {
-            isStreaming = false;
-            lastStreamStopReason = "Stream schedule window closed";
-            lastStreamStopMs = millis();
-        }
+        stopAllRtspClients("Stream schedule window closed");
         if (rtspServerEnabled) {
             rtspServerEnabled = false;
             rtspServer.stop();
@@ -1193,7 +1187,7 @@ void checkDeepSleepSchedule() {
         deepSleepStatusCode = "reboot_pending";
         return;
     }
-    if (rtspClient && rtspClient.connected()) {
+    if (getRtspClientCount() > 0) {
         deepSleepStatusCode = "client_connected";
         return;
     }
@@ -1247,16 +1241,11 @@ void checkDeepSleepSchedule() {
                   formatClockHHMM(streamScheduleStopMin) +
                   ", sleeping for " + String(sleepSec) +
                   " s (wake guard " + String(DEEP_SLEEP_DRIFT_GUARD_SEC) + " s).");
-    if (rtspClient && rtspClient.connected()) {
-        rtspClient.stop();
-    }
-    isStreaming = false;
+    stopAllRtspClients("Deep sleep outside stream schedule");
     if (rtspServerEnabled) {
         rtspServerEnabled = false;
         rtspServer.stop();
     }
-    lastStreamStopReason = "Deep sleep outside stream schedule";
-    lastStreamStopMs = millis();
     if (mqttClient.connected()) {
         mqttPublishState(true);
         mqttClient.publish(mqttAvailabilityTopic().c_str(), "offline", true);
@@ -1415,12 +1404,7 @@ void checkTemperature() {
             overheatLockoutActive = true;
             recordOverheatTrip(temp);
             // Disable streaming until user restarts manually
-            if (rtspClient && rtspClient.connected()) {
-                rtspClient.stop();
-            }
-            if (isStreaming) {
-                isStreaming = false;
-            }
+            stopAllRtspClients("Thermal protection");
             rtspServerEnabled = false;
             rtspServer.stop();
             mqttPublishState(true);
@@ -1680,7 +1664,7 @@ void applyMdnsSetting() {
     MDNS.addService("http", "tcp", 80);
     MDNS.addService("rtsp", "tcp", 8554);
     mdnsRunning = true;
-    simplePrintln("mDNS ready: http://" + mdnsHostname + ".local/ ; rtsp://" + mdnsHostname + ".local:8554/audio");
+    simplePrintln("mDNS ready: http://" + mdnsHostname + ".local/ ; rtsp://" + mdnsHostname + ".local:8554/audio1");
 }
 
 // Schedule a safe reboot (optionally with factory reset) after delayMs
@@ -1787,7 +1771,7 @@ void resetToDefaultSettings() {
 // Restart I2S with new parameters
 void restartI2S() {
     simplePrintln("Restarting I2S with new parameters...");
-    isStreaming = false;
+    stopAllRtspClients("I2S restart");
 
     if (i2s_32bit_buffer) { free(i2s_32bit_buffer); i2s_32bit_buffer = nullptr; }
     if (i2s_16bit_buffer) { free(i2s_16bit_buffer); i2s_16bit_buffer = nullptr; }
@@ -2035,13 +2019,23 @@ void streamAudio() {
             s = (uint16_t)((s << 8) | (s >> 8));
             i2s_16bit_network_buffer[i] = (int16_t)s;
         }
+        bool deliveredProfile[2] = {false, false};
         for (uint8_t i = 0; i < MAX_CLIENTS; i++) {
             if (!clients[i].streaming) continue;
             uint8_t pi = clients[i].profileIndex;
             sendRTPPacket(clients[i], i2s_16bit_network_buffer, samplesRead);
             if (clients[i].streaming) {
-                streamStats[pi].packetsSent++;
+                deliveredProfile[pi] = true;
             }
+        }
+        bool deliveredAny = false;
+        for (uint8_t pi = 0; pi < 2; pi++) {
+            if (!deliveredProfile[pi]) continue;
+            streamStats[pi].packetsSent++;
+            deliveredAny = true;
+        }
+        if (deliveredAny) {
+            audioPacketsSent++;
         }
     }
 }
@@ -2051,6 +2045,14 @@ static uint8_t detectProfileFromRequest(const String &request) {
     String firstLine = (lineEnd > 0) ? request.substring(0, lineEnd) : request;
     if (firstLine.indexOf("/audio2") >= 0) return 1;
     return 0;
+}
+
+static bool anyRtspSessionStreaming(uint8_t profileIndex = 255) {
+    for (uint8_t i = 0; i < MAX_CLIENTS; i++) {
+        if (!clients[i].streaming) continue;
+        if (profileIndex == 255 || clients[i].profileIndex == profileIndex) return true;
+    }
+    return false;
 }
 
 static void parseTransportHeader(ClientSession &session, const String &request, String &transportResponse, uint8_t clientIdx) {
@@ -2120,7 +2122,7 @@ void handleRTSPCommand(ClientSession &session, String request, uint8_t clientIdx
 
     } else if (request.startsWith("DESCRIBE")) {
         String ip = WiFi.localIP().toString();
-        String streamPath = (session.profileIndex == 1) ? "/audio2" : "/audio";
+        String streamPath = (session.profileIndex == 1) ? "/audio2" : "/audio1";
         String sdp = "v=0\r\n";
         sdp += "o=- 0 0 IN IP4 " + ip + "\r\n";
         sdp += "s=ESP32 RTSP Mic " + streamPath + " (" + String(currentSampleRate) + "Hz, 16-bit PCM)\r\n";
@@ -2153,18 +2155,26 @@ void handleRTSPCommand(ClientSession &session, String request, uint8_t clientIdx
         session.client.print("Session: " + session.sessionId + "\r\n");
         session.client.print("Range: npt=0.000-\r\n\r\n");
 
+        bool wasAnyStreaming = anyRtspSessionStreaming();
+        bool wasProfileStreaming = anyRtspSessionStreaming(session.profileIndex);
         session.streaming = true;
         session.rtpSequence = 0;
         session.rtpTimestamp = 0;
         session.packetsSent = 0;
-        lastStatsReset = millis();
+        if (!wasAnyStreaming) {
+            audioPacketsSent = 0;
+            lastStatsReset = millis();
+            streamStartedAtMs = millis();
+        }
         lastRtspPlayMs = millis();
         streamStats[session.profileIndex].streaming = true;
         streamStats[session.profileIndex].lastPlayMs = millis();
-        streamStats[session.profileIndex].statsResetMs = millis();
+        if (!wasProfileStreaming) {
+            streamStats[session.profileIndex].packetsSent = 0;
+            streamStats[session.profileIndex].statsResetMs = millis();
+        }
         rtspPlayCount++;
-        streamStartedAtMs = millis();
-        lastRtpPacketMs = streamStartedAtMs;
+        lastRtpPacketMs = millis();
         lastStreamStopReason = "none";
         lastStreamStopMs = 0;
         simplePrintln("STREAMING STARTED stream" + String(session.profileIndex + 1));
@@ -2253,10 +2263,49 @@ void getStreamClientCounts(uint8_t &s1, uint8_t &s2) {
     }
 }
 
+uint8_t getRtspClientCount() {
+    uint8_t count = 0;
+    for (uint8_t i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i].client.connected()) count++;
+    }
+    return count;
+}
+
+String getRtspClientSummary() {
+    String summary;
+    for (uint8_t i = 0; i < MAX_CLIENTS; i++) {
+        if (!clients[i].client.connected()) continue;
+        if (summary.length()) summary += ",";
+        summary += clients[i].client.remoteIP().toString();
+        summary += "/audio";
+        summary += String(clients[i].profileIndex + 1);
+    }
+    return summary;
+}
+
+void stopAllRtspClients(const char* reason) {
+    bool hadStreaming = false;
+    for (uint8_t i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i].streaming) hadStreaming = true;
+        clients[i].reset();
+    }
+    for (uint8_t i = 0; i < 2; i++) {
+        streamStats[i].streaming = false;
+        streamStats[i].clientCount = 0;
+    }
+    rtspClient = WiFiClient();
+    rtspSessionId = "";
+    isStreaming = false;
+    if (reason && reason[0]) {
+        lastStreamStopReason = reason;
+        if (hadStreaming) lastStreamStopMs = millis();
+    }
+}
+
 static void refreshLegacyRtspState() {
     isStreaming = false;
-    audioPacketsSent = 0;
     rtspClient = WiFiClient();
+    rtspSessionId = "";
     for (uint8_t i = 0; i < MAX_CLIENTS; i++) {
         if (clients[i].client.connected() && !rtspClient.connected()) {
             rtspClient = clients[i].client;
@@ -2264,7 +2313,6 @@ static void refreshLegacyRtspState() {
         }
         if (clients[i].streaming) {
             isStreaming = true;
-            audioPacketsSent += clients[i].packetsSent;
             if (rtspSessionId.length() == 0) rtspSessionId = clients[i].sessionId;
         }
     }
@@ -2389,10 +2437,10 @@ void setup() {
 
     if (!overheatLatched && rtspServerEnabled) {
         simplePrintln("RTSP server ready on port 8554");
-        simplePrintln("RTSP URL1 (IP): rtsp://" + WiFi.localIP().toString() + ":8554/audio");
+        simplePrintln("RTSP URL1 (IP): rtsp://" + WiFi.localIP().toString() + ":8554/audio1");
         simplePrintln("RTSP URL2 (IP): rtsp://" + WiFi.localIP().toString() + ":8554/audio2");
         if (mdnsEnabled) {
-            simplePrintln("RTSP URL1 (mDNS): rtsp://" + mdnsHostname + ".local:8554/audio");
+            simplePrintln("RTSP URL1 (mDNS): rtsp://" + mdnsHostname + ".local:8554/audio1");
             simplePrintln("RTSP URL2 (mDNS): rtsp://" + mdnsHostname + ".local:8554/audio2");
         }
         simplePrintln("You can stream via IP or mDNS (if enabled).");
@@ -2448,7 +2496,7 @@ void loop() {
     checkScheduledReset();
     checkMqtt();
 
-    // RTSP client management (2 concurrent sessions)
+    // RTSP client management (configurable 1-3 concurrent sessions)
     if (rtspServerEnabled) {
         for (uint8_t i = 0; i < MAX_CLIENTS; i++) {
             if (clients[i].client && !clients[i].client.connected()) {
@@ -2496,9 +2544,7 @@ void loop() {
         }
         streamAudio();
     } else {
-        for (uint8_t i = 0; i < MAX_CLIENTS; i++) {
-            clients[i].reset();
-        }
+        stopAllRtspClients("RTSP server disabled");
     }
     refreshLegacyRtspState();
     // Handle deferred WiFi reconnect
@@ -2506,12 +2552,8 @@ void loop() {
         wifiReconnectAt = 0;
 
         bool wasStreaming = isStreaming;
-        for (uint8_t i = 0; i < MAX_CLIENTS; i++) {
-            clients[i].reset();
-        }
+        stopAllRtspClients("WiFi reconnect requested");
         refreshLegacyRtspState();
-        lastStreamStopReason = "WiFi reconnect requested";
-        lastStreamStopMs = millis();
         if (wasStreaming) mqttPublishState(true);
 
         String ssid = WiFi.SSID();

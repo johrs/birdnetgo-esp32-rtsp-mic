@@ -66,6 +66,8 @@ extern uint8_t maxActiveClients;
 struct StreamStats { uint8_t clientCount; bool streaming; uint32_t packetsSent; unsigned long statsResetMs; unsigned long lastConnectMs; unsigned long lastPlayMs; };
 extern StreamStats streamStats[2];
 extern void getStreamClientCounts(uint8_t &s1, uint8_t &s2);
+extern String getRtspClientSummary();
+extern void stopAllRtspClients(const char* reason);
 
 // Local helper: snap requested Wi‑Fi TX power (dBm) to nearest supported step
 static float snapWifiTxDbm(float dbm) {
@@ -211,6 +213,8 @@ static void httpStatus() {
     String uptimeStr = formatUptime(uptimeSeconds);
     String localTimeStr = formatLocalDateTimeSafe();
     String utcTimeStr = formatUtcDateTimeSafe();
+    uint32_t freeHeap = ESP.getFreeHeap();
+    if (freeHeap < minFreeHeap) minFreeHeap = freeHeap;
     unsigned long runtime = millis() - lastStatsReset;
     uint32_t currentRate = (isStreaming && runtime > 1000) ? (audioPacketsSent * 1000) / runtime : 0;
     String json = "{";
@@ -242,7 +246,7 @@ static void httpStatus() {
     json += "\"mdns_hostname\":\"" + jsonEscape(mdnsHostname) + "\",";
     json += "\"wifi_rssi\":" + String(WiFi.RSSI()) + ",";
     json += "\"wifi_tx_dbm\":" + String(wifiPowerLevelToDbm(currentWifiPowerLevel),1) + ",";
-    json += "\"free_heap_kb\":" + String(ESP.getFreeHeap()/1024) + ",";
+    json += "\"free_heap_kb\":" + String(freeHeap/1024) + ",";
     json += "\"min_free_heap_kb\":" + String(minFreeHeap/1024) + ",";
     json += "\"uptime\":\"" + uptimeStr + "\",";
     json += "\"time_synced\":" + String(timeSynced?"true":"false") + ",";
@@ -273,7 +277,7 @@ static void httpStatus() {
     json += "\"deep_sleep_status_code\":\"" + jsonEscape(deepSleepStatusCode) + "\",";
     json += "\"deep_sleep_next_sec\":" + String(deepSleepNextSleepSec) + ",";
     json += "\"rtsp_server_enabled\":" + String(rtspServerEnabled?"true":"false") + ",";
-    if (rtspClient && rtspClient.connected()) json += "\"client\":\"" + rtspClient.remoteIP().toString() + "\","; else json += "\"client\":\"\",";
+    json += "\"client\":\"" + jsonEscape(getRtspClientSummary()) + "\",";
     json += "\"streaming\":" + String(isStreaming?"true":"false") + ",";
     json += "\"current_rate_pkt_s\":" + String(currentRate) + ",";
     json += "\"last_rtsp_connect\":\"" + jsonEscape(formatSince(lastRtspClientConnectMs)) + "\",";
@@ -401,7 +405,7 @@ static void httpActionServerStart(){
 static void httpActionServerStop(){
     if (!requireMutationAuth()) return;
 
-    rtspServerEnabled=false; if (rtspClient && rtspClient.connected()) rtspClient.stop(); isStreaming=false; rtspServer.stop();
+    rtspServerEnabled=false; stopAllRtspClients("Web UI RTSP server disabled"); rtspServer.stop();
     webui_pushLog(F("UI action: server_stop"));
     apiSendJSON(F("{\"ok\":true}"));
 }
